@@ -225,12 +225,6 @@ body {
     overflow-y: auto;
 }
 
-.user-list-scroll {
-    max-height: calc(100vh - 260px);
-    overflow-y: auto;
-}
-
-
 .user-list-item {
     display: flex;
     align-items: center;
@@ -396,6 +390,40 @@ body {
     margin-bottom: 10px;
 }
 
+.pill {
+    border-radius: 999px;
+    padding: 4px 10px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 12px;
+    color: var(--text-soft);
+}
+
+.watch-user-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.watch-username {
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.watch-date {
+    font-size: 12px;
+    color: var(--text-soft);
+}
+
+.watch-description {
+    font-size: 13px;
+    color: var(--text-soft);
+    margin-top: 6px;
+}
+
+/* Follow button + hint */
+
 .watch-follow-row {
     display: flex;
     align-items: center;
@@ -439,6 +467,7 @@ body {
 }
 
 /* Tooltip */
+
 .follow-hint::after {
     content: attr(data-tooltip);
     position: absolute;
@@ -461,39 +490,6 @@ body {
 
 .follow-hint:hover::after {
     opacity: 1;
-}
-
-
-.pill {
-    border-radius: 999px;
-    padding: 4px 10px;
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    font-size: 12px;
-    color: var(--text-soft);
-}
-
-.watch-user-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 6px;
-}
-
-.watch-username {
-    font-size: 15px;
-    font-weight: 600;
-}
-
-.watch-date {
-    font-size: 12px;
-    color: var(--text-soft);
-}
-
-.watch-description {
-    font-size: 13px;
-    color: var(--text-soft);
-    margin-top: 6px;
 }
 
 /* Up next */
