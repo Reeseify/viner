@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Vine Archive</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="/styles.css" />
+</head>
+
+<body>
+    <!-- Archive disclaimer modal -->
+    <div id="archive-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2>Vine Archive (Read-Only)</h2>
+            <p>
+                This site is an independent archive of Vine data. Everything here is
+                <strong>read-only</strong> – you cannot log in, post, delete, or
+                modify any content.
+            </p>
+            <label class="modal-checkbox">
+                <input type="checkbox" id="archive-modal-hide" />
+                Don’t show this again
+            </label>
+            <button id="archive-modal-close">Got it</button>
+        </div>
+    </div>
+
+    <header class="topbar">
+        <div class="topbar-left">
+            <div class="logo-mark">V</div>
+            <div class="logo-text">
+                <div class="logo-title">Vine Archive</div>
+                <div class="logo-subtitle">The resurrected feed</div>
+            </div>
+        </div>
+
+        <div class="topbar-center">
+            <form id="search-form">
+                <input id="search-input" type="search" placeholder="Search vines or users" autocomplete="off" />
+                <button type="submit">Search</button>
+            </form>
+        </div>
+
+        <div class="topbar-right">
+            <div class="stat-pill">
+                <span class="stat-label">Total vines</span>
+                <span id="vine-count" class="stat-value">…</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="page">
+        <aside class="sidebar">
+            <nav class="nav">
+                <button class="nav-item" data-nav="home">Home</button>
+                <button class="nav-item" data-nav="history">Watch history</button>
+            </nav>
+
+            <div class="sidebar-section">
+                <h3>Saved profiles</h3>
+                <div id="saved-user-list" class="user-list"></div>
+            </div>
+
+            <div class="sidebar-section">
+                <h3>All profiles</h3>
+                <div id="user-list" class="user-list user-list-scroll"></div>
+            </div>
+
+        </aside>
+
+        <main class="main">
+            <!-- Home/feed view -->
+            <section id="view-feed" class="view active">
+                <h2 class="view-title" id="feed-title">Home</h2>
+                <div id="feed-list" class="card-grid"></div>
+            </section>
+
+            <!-- Watch view -->
+            <section id="view-watch" class="view">
+                <div class="watch-layout">
+                    <div class="watch-main">
+                        <div class="video-wrapper">
+                            <video id="watch-video" controls autoplay loop></video>
+                        </div>
+                        <div class="watch-meta">
+                            <h1 id="watch-title" class="watch-title"></h1>
+
+                            <div class="watch-stats-row">
+                                <span id="watch-loops" class="pill"></span>
+                                <span id="watch-likes" class="pill"></span>
+                                <span id="watch-reposts" class="pill"></span>
+                                <span id="watch-comments" class="pill"></span>
+                            </div>
+
+                            <div class="watch-user-row">
+                                <img id="watch-avatar" class="avatar avatar-lg" src="" alt="" />
+                                <div class="watch-user-text">
+                                    <div id="watch-username" class="watch-username"></div>
+                                    <div id="watch-created" class="watch-date"></div>
+                                </div>
+                            </div>
+
+                            <div class="watch-follow-row">
+                                <button id="follow-btn" class="follow-btn">Follow</button>
+                                <span class="follow-hint"
+                                    data-tooltip="These follows are only saved in your browser as quick links. They don’t affect any real accounts.">
+                                    ?
+                                </span>
+                            </div>
+
+
+                            <p id="watch-description" class="watch-description"></p>
+                        </div>
+                    </div>
+
+                    <aside class="watch-upnext">
+                        <div class="watch-upnext-header">
+                            <h3>Up next</h3>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="autoplay-toggle" checked />
+                                Autoplay
+                            </label>
+                        </div>
+                        <div id="upnext-list" class="upnext-list"></div>
+                    </aside>
+                </div>
+            </section>
+
+            <!-- History view -->
+            <section id="view-history" class="view">
+                <h2 class="view-title">Watch history</h2>
+                <div id="history-list" class="card-grid"></div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/app.js" defer></script>
+</body>
+
+</html>
