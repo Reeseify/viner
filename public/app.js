@@ -27,7 +27,6 @@ function formatCountLabel(label, n) {
 
 function timeAgo(created) {
     if (!created) return "";
-    // handles "2016-07-31T22:08:15.000000"
     const match = created.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/);
     let iso = created;
     if (match) iso = match[1] + "Z";
@@ -63,6 +62,21 @@ function formatFullDate(created) {
         year: "numeric",
     });
 }
+
+function escapeHTML(str) {
+    return String(str || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+}
+
+function setNavActive(mode) {
+    document.querySelectorAll(".nav-item").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.nav === mode);
+    });
+}
+
+// --- history helpers ---
 
 function saveHistoryEntry(post) {
     try {
@@ -105,11 +119,7 @@ function loadHistory() {
     }
 }
 
-function setNavActive(mode) {
-    document.querySelectorAll(".nav-item").forEach((btn) => {
-        btn.classList.toggle("active", btn.dataset.nav === mode);
-    });
-}
+// --- saved profiles (fake follows) ---
 
 const SAVED_PROFILES_KEY = "vineArchiveSavedProfiles";
 
@@ -178,7 +188,6 @@ function toggleFollowCurrentProfile() {
             username: username || "",
             avatarUrl: avatarUrl || "",
         });
-        // optional limit
         savedProfiles = savedProfiles.slice(0, 200);
     }
 
@@ -197,22 +206,21 @@ function initSavedProfiles() {
     }
 }
 
-
-// --- global state ---
+// --- globals ---
 
 let currentUserId = null;
 let currentPostId = null;
 let autoplay = true;
 
-let allUsersCache = null;
+let feedPosts = [];
+let feedRendered = 0;
+const FEED_PAGE_SIZE = 40;
+
+let savedProfiles = [];
 let currentUserPostsCache = {}; // userId -> posts array
+let currentProfileInfo = null;
 
-let savedProfiles = [];          // browser-cached follows
-let usersRendered = 0;           // how many /api/users have been rendered
-const USERS_PAGE_SIZE = 40;      // how many profiles per chunk
-let currentProfileInfo = null;   // {userId, username, avatarUrl}
-
-// --- DOM refs ---
+// DOM refs
 
 const viewFeed = document.getElementById("view-feed");
 const viewWatch = document.getElementById("view-watch");
@@ -220,10 +228,10 @@ const viewHistory = document.getElementById("view-history");
 const feedList = document.getElementById("feed-list");
 const feedTitle = document.getElementById("feed-title");
 const vineCountSpan = document.getElementById("vine-count");
-const userListEl = document.getElementById("user-list");
 const historyList = document.getElementById("history-list");
 
-// watch view elements
+const savedUserListEl = document.getElementById("saved-user-list");
+
 const watchVideo = document.getElementById("watch-video");
 const watchTitle = document.getElementById("watch-title");
 const watchLoops = document.getElementById("watch-loops");
@@ -236,13 +244,13 @@ const watchCreated = document.getElementById("watch-created");
 const watchDescription = document.getElementById("watch-description");
 const upnextList = document.getElementById("upnext-list");
 const autoplayToggle = document.getElementById("autoplay-toggle");
+const followBtn = document.getElementById("follow-btn");
 
-// modal
 const modal = document.getElementById("archive-modal");
 const modalClose = document.getElementById("archive-modal-close");
 const modalHide = document.getElementById("archive-modal-hide");
 
-// --- views switching ---
+// --- view switching ---
 
 function showView(name) {
     viewFeed.classList.remove("active");
@@ -254,51 +262,61 @@ function showView(name) {
     else if (name === "history") viewHistory.classList.add("active");
 }
 
-// --- feed rendering ---
+// --- feed rendering (cards) ---
 
-function renderFeed(posts) {
-    feedList.innerHTML = "";
-    posts.forEach((p) => {
-        const card = document.createElement("div");
-        card.className = "vine-card";
-        card.addEventListener("click", () => {
-            history.pushState(null, "", `/v/${encodeURIComponent(p.postId)}`);
-            routeFromLocation();
-        });
+function createFeedCard(p) {
+    const card = document.createElement("div");
+    card.className = "vine-card";
 
-        const thumbUrl = p.thumbnailUrl || "";
+    const postId = String(p.postIdStr || p.postId || "");
+    card.addEventListener("click", () => {
+        if (!postId) return;
+        history.pushState(null, "", `/v/${encodeURIComponent(postId)}`);
+        routeFromLocation();
+    });
 
-        card.innerHTML = `
-      <div class="vine-card-thumb">
-        ${thumbUrl
-                ? `<img loading="lazy" src="${thumbUrl}" alt="thumbnail">`
-                : '<div style="height:0;padding-bottom:56.25%;background:#000;"></div>'
-            }
-        <span class="vine-card-duration">0:06</span>
-      </div>
-      <div class="vine-card-body">
-        <img class="avatar" src="${(p.avatarUrl || "").replace(
-                /^$/,
-                ""
-            )}" alt="">
-        <div class="vine-card-meta">
-          <h3 class="vine-card-title">${escapeHTML(
-                p.description || "(no description)"
-            )}</h3>
-          <div class="vine-card-user">
-            <span>${escapeHTML(p.username || "Unknown")}</span>
-            <span>•</span>
-            <span>${timeAgo(p.created)}</span>
-          </div>
-          <div class="vine-card-stats">
-            ${formatLoops(p.loops || p.loopCount)} • ${p.likes != null ? formatCountLabel("likes", p.likes) : ""
-            }
-          </div>
+    const thumbUrl = p.thumbnailUrl || "";
+    const avatarUrl = p.avatarUrl || "";
+
+    card.innerHTML = `
+    <div class="vine-card-thumb">
+      ${thumbUrl
+            ? `<img loading="lazy" src="${thumbUrl}" alt="thumbnail">`
+            : '<div style="height:0;padding-bottom:56.25%;background:#000;"></div>'
+        }
+      <span class="vine-card-duration">0:06</span>
+    </div>
+    <div class="vine-card-body">
+      <img class="avatar" src="${avatarUrl}" alt="">
+      <div class="vine-card-meta">
+        <h3 class="vine-card-title">${escapeHTML(
+            p.description || "(no description)"
+        )}</h3>
+        <div class="vine-card-user">
+          <span>${escapeHTML(p.username || "Unknown")}</span>
+          <span>•</span>
+          <span>${timeAgo(p.created)}</span>
+        </div>
+        <div class="vine-card-stats">
+          ${formatLoops(p.loops || p.loopCount)}${p.likes != null ? " • " + formatCountLabel("likes", p.likes) : ""
+        }
         </div>
       </div>
-    `;
+    </div>
+  `;
+    return card;
+}
+
+function renderFeedChunk() {
+    if (!feedPosts || !feedPosts.length) return;
+    let count = 0;
+    while (feedRendered < feedPosts.length && count < FEED_PAGE_SIZE) {
+        const p = feedPosts[feedRendered];
+        const card = createFeedCard(p);
         feedList.appendChild(card);
-    });
+        feedRendered++;
+        count++;
+    }
 }
 
 // --- up next rendering ---
@@ -338,104 +356,31 @@ function renderUpNext(posts, currentId) {
     });
 }
 
-// --- user list rendering ---
-
-function renderUserList(users) {
-    userListEl.innerHTML = "";
-    users.forEach((u) => {
-        const row = document.createElement("div");
-        row.className = "user-list-item";
-        row.addEventListener("click", () => {
-            history.pushState(null, "", `/u/${encodeURIComponent(u.userId)}`);
-            routeFromLocation();
-        });
-
-        row.innerHTML = `
-      <div class="avatar"></div>
-      <div>
-        <div class="user-list-name">${escapeHTML(u.username || "Unknown")}</div>
-        <div class="user-list-count">${(u.postCount || 0).toLocaleString(
-            "en-US"
-        )} vines</div>
-      </div>
-    `;
-        userListEl.appendChild(row);
-    });
-}
-
-function appendUserRow(u) {
-    const row = document.createElement("div");
-    row.className = "user-list-item";
-    row.addEventListener("click", () => {
-        history.pushState(null, "", `/u/${encodeURIComponent(u.userId)}`);
-        routeFromLocation();
-    });
-
-    row.innerHTML = `
-    <div class="avatar"></div>
-    <div>
-      <div class="user-list-name">${escapeHTML(u.username || "Unknown")}</div>
-      <div class="user-list-count">${(u.postCount || 0).toLocaleString(
-        "en-US"
-    )} vines</div>
-    </div>
-  `;
-
-    userListEl.appendChild(row);
-}
-
-function renderUserChunk() {
-    if (!allUsersCache) return;
-    let count = 0;
-    while (
-        usersRendered < allUsersCache.length &&
-        count < USERS_PAGE_SIZE
-    ) {
-        appendUserRow(allUsersCache[usersRendered]);
-        usersRendered++;
-        count++;
-    }
-}
-
-function onUserListScroll() {
-    if (
-        userListEl.scrollTop + userListEl.clientHeight >=
-        userListEl.scrollHeight - 40
-    ) {
-        renderUserChunk();
-    }
-}
-
-
-
-// --- main load functions ---
-
-async function loadUsersOnce() {
-    if (allUsersCache) return allUsersCache;
-    const users = await fetchJSON("/api/users");
-    allUsersCache = users;
-    renderUserList(users);
-    return users;
-}
+// --- load feed / search / user profile ---
 
 async function loadFeed() {
     setNavActive("home");
     showView("feed");
     feedTitle.textContent = "Home";
     const posts = await fetchJSON("/api/feed?limit=120");
-    renderFeed(posts);
+    feedPosts = posts;
+    feedRendered = 0;
+    feedList.innerHTML = "";
+    renderFeedChunk();
 }
 
 async function loadHistoryView() {
     setNavActive("history");
     showView("history");
-    const history = loadHistory();
+
+    const historyItems = loadHistory();
     historyList.innerHTML = "";
-    history.forEach((p) => {
+    historyItems.forEach((p) => {
         const card = document.createElement("div");
         card.className = "vine-card";
         card.addEventListener("click", () => {
-            historyPushToWatch(p.postId);
+            history.pushState(null, "", `/v/${encodeURIComponent(p.postId)}`);
+            routeFromLocation();
         });
         const thumbUrl = p.thumbnailUrl || "";
 
@@ -468,17 +413,26 @@ async function loadHistoryView() {
     });
 }
 
-function historyPushToWatch(postId) {
-    history.pushState(null, "", `/v/${encodeURIComponent(postId)}`);
-    routeFromLocation();
-}
-
 async function loadUserPosts(userId) {
     if (currentUserPostsCache[userId]) return currentUserPostsCache[userId];
     const posts = await fetchJSON(`/api/users/${encodeURIComponent(userId)}/posts`);
     currentUserPostsCache[userId] = posts;
     return posts;
 }
+
+async function loadUserProfile(userId) {
+    setNavActive("");
+    showView("feed");
+    feedTitle.textContent = "User profile";
+
+    const posts = await loadUserPosts(userId);
+    feedPosts = posts;
+    feedRendered = 0;
+    feedList.innerHTML = "";
+    renderFeedChunk();
+}
+
+// --- watch page ---
 
 async function loadWatchByPostId(postId) {
     try {
@@ -495,27 +449,33 @@ async function loadWatchByPostId(postId) {
             return;
         }
 
+        const avatar = data.avatarUrl || "";
+
         currentUserId = userId;
         currentPostId = resolvedPostId;
+        currentProfileInfo = { userId, username, avatarUrl: avatar };
+        updateFollowButtonUI();
 
         setNavActive("");
         showView("watch");
 
-        // main video
-        watchVideo.src = data.videoUrl || data.videoLowURL || data.videoDashUrl || "";
+        watchVideo.src =
+            data.videoUrl || data.videoLowURL || data.videoDashUrl || "";
         watchTitle.textContent = data.description || "(no description)";
         watchLoops.textContent = formatLoops(data.loops || data.loopCount);
-        watchLikes.textContent = formatCountLabel("likes", data.likes || data.likeCount);
-        watchReposts.textContent = formatCountLabel("reposts", data.reposts || data.repostCount);
-        watchComments.textContent = formatCountLabel("comments", data.comments || data.commentCount);
+        watchLikes.textContent = formatCountLabel(
+            "likes",
+            data.likes || data.likeCount
+        );
+        watchReposts.textContent = formatCountLabel(
+            "reposts",
+            data.reposts || data.repostCount
+        );
+        watchComments.textContent = formatCountLabel(
+            "comments",
+            data.comments || data.commentCount
+        );
 
-        const avatar = data.avatarUrl || "";
-        currentProfileInfo = {
-            userId,
-            username,
-            avatarUrl: avatar,
-        };
-        updateFollowButtonUI();
         if (avatar) {
             watchAvatar.src = avatar;
             watchAvatar.style.display = "block";
@@ -568,14 +528,16 @@ async function performSearch(query) {
     showView("feed");
     feedTitle.textContent = `Results for "${query}"`;
     const results = await fetchJSON(`/api/search?q=${encodeURIComponent(query)}`);
-    renderFeed(results);
+    feedPosts = results;
+    feedRendered = 0;
+    feedList.innerHTML = "";
+    renderFeedChunk();
 }
 
 // --- vine count ---
 
 async function loadVineCount() {
     try {
-        // Try /api/stats if you added it
         const statsRes = await fetch("/api/stats");
         if (statsRes.ok) {
             const stats = await statsRes.json();
@@ -589,7 +551,6 @@ async function loadVineCount() {
     }
 
     try {
-        // fallback: sum postCount from /api/users
         const users = await fetchJSON("/api/users");
         const total = users.reduce(
             (sum, u) => sum + (Number(u.postCount) || 0),
@@ -606,7 +567,6 @@ async function loadVineCount() {
 function routeFromLocation() {
     const path = window.location.pathname || "/";
 
-    // /v/:id
     const vineMatch = path.match(/^\/v\/([^/]+)$/);
     if (vineMatch) {
         const postId = decodeURIComponent(vineMatch[1]);
@@ -614,16 +574,14 @@ function routeFromLocation() {
         return;
     }
 
-    // /u/:id or /u/name
     const userMatch = path.match(/^\/u\/([^/]+)$/);
     if (userMatch) {
         const idOrName = decodeURIComponent(userMatch[1]);
-        // simple: treat as userId (you can extend to vanity if you want)
+        // right now treat as numeric userId
         loadUserProfile(idOrName);
         return;
     }
 
-    // /search?q=...
     const params = new URLSearchParams(window.location.search);
     const q = params.get("q");
     if (path === "/search" && q) {
@@ -631,17 +589,7 @@ function routeFromLocation() {
         return;
     }
 
-    // default: home
     loadFeed();
-}
-
-async function loadUserProfile(userId) {
-    setNavActive("");
-    showView("feed");
-    feedTitle.textContent = "User profile";
-
-    const posts = await loadUserPosts(userId);
-    renderFeed(posts);
 }
 
 // --- modal ---
@@ -667,16 +615,7 @@ function initArchiveModal() {
     }
 }
 
-// --- utils ---
-
-function escapeHTML(str) {
-    return String(str || "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-}
-
-// --- init ---
+// --- nav / search / autoplay ---
 
 function initNavButtons() {
     document.querySelectorAll(".nav-item").forEach((btn) => {
@@ -718,19 +657,33 @@ function initAutoplay() {
     });
 }
 
+// --- scrolling for feed chunks ---
+
+function onWindowScroll() {
+    if (!viewFeed.classList.contains("active")) return;
+    const bottom =
+        window.innerHeight + window.scrollY >=
+        document.body.offsetHeight - 200;
+    if (bottom) {
+        renderFeedChunk();
+    }
+}
+
+// --- init ---
+
 window.addEventListener("popstate", () => {
     routeFromLocation();
 });
 
-window.addEventListener("DOMContentLoaded", async () => {
+window.addEventListener("DOMContentLoaded", () => {
     initArchiveModal();
     initNavButtons();
     initSearch();
     initAutoplay();
+    initSavedProfiles();
 
     loadVineCount();
-    loadUsersOnce();
     routeFromLocation();
-    userListEl.addEventListener("scroll", onUserListScroll);
-
 });
+
+window.addEventListener("scroll", onWindowScroll);
