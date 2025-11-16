@@ -3,336 +3,379 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awscfg "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// Regex to find Vine video URLs and capture the slug.
-var vineURLRe = regexp.MustCompile(`https?://vine\.co/v/([A-Za-z0-9]+)`)
+var (
+	inputDir  = flag.String("inputDir", "", "Input dir: local path or s3://bucket/prefix")
+	outDir    = flag.String("outDir", "", "Output dir: local path or s3://bucket/prefix")
+	workers   = flag.Int("workers", 32, "Number of concurrent workers")
+	download  = flag.Bool("download", false, "Unused for now (kept for compatibility)")
+	loopEvery = flag.Duration("loopEvery", 0, "If >0, rescan every given interval (e.g. 10m, 1h)")
+)
+
+// regex to find vine.co/v/SLUG
+var vineRe = regexp.MustCompile(`vine\.co/v/([A-Za-z0-9]+)`)
+
+type sourceType int
+
+const (
+	srcLocal sourceType = iota
+	srcS3
+)
+
+type s3Path struct {
+	Bucket string
+	Prefix string
+}
 
 func main() {
-	inputDir := flag.String("inputDir", "", "Local dir or s3://bucket/prefix/")
-	outDir := flag.String("outDir", "vine_archive_harvest", "Output directory")
-	workers := flag.Int("workers", runtime.NumCPU()*4, "Number of worker goroutines")
-	download := flag.Bool("download", false, "Download videos (not implemented; reserved)")
 	flag.Parse()
 
-	if *inputDir == "" {
-		log.Fatal("-inputDir is required")
+	if *inputDir == "" || *outDir == "" {
+		log.Fatal("inputDir and outDir are required")
 	}
 
-	if err := os.MkdirAll(*outDir, 0o755); err != nil {
-		log.Fatalf("create outDir %s: %v", *outDir, err)
-	}
+	srcKind := detectSource(*inputDir)
 
-	start := time.Now()
+	ctx := context.Background()
 
-	var (
-		slugs map[string]struct{}
-		err   error
-	)
+	var s3Client *s3.Client
+	var inS3, outS3 *s3Path
 
-	if strings.HasPrefix(*inputDir, "s3://") {
-		// ----- S3 / R2 path -----
-		ctx := context.Background()
-		client, bucket, prefix, errInit := newS3ClientFromEnv(ctx, *inputDir)
-		if errInit != nil {
-			log.Fatalf("init S3 client: %v", errInit)
-		}
-		log.Printf("=== Scanning %s for Vine video URLs (S3/R2) ===", *inputDir)
-		slugs, err = scanS3ForSlugs(ctx, client, bucket, prefix, *workers)
-	} else {
-		// ----- Local filesystem path -----
-		log.Printf("=== Scanning %s for Vine video URLs (local) ===", *inputDir)
-		slugs, err = scanLocalForSlugs(*inputDir, *workers)
-	}
-
-	if err != nil {
-		log.Fatalf("scan failed: %v", err)
-	}
-
-	// Turn map into sorted slice.
-	list := make([]string, 0, len(slugs))
-	for slug := range slugs {
-		list = append(list, slug)
-	}
-	sort.Strings(list)
-
-	if err := writeOutputs(*outDir, list); err != nil {
-		log.Fatalf("write outputs: %v", err)
-	}
-
-	log.Printf("Done. Found %d unique Vine slugs in %s", len(list), time.Since(start))
-	if *download {
-		log.Printf("Note: -download=true is not implemented in this stripped-down harvester.")
-	}
-}
-
-// writeOutputs writes vine_slugs.txt and vine_slugs.json.
-func writeOutputs(outDir string, slugs []string) error {
-	txtPath := filepath.Join(outDir, "vine_slugs.txt")
-	jsonPath := filepath.Join(outDir, "vine_slugs.json")
-
-	// Text file
-	tf, err := os.Create(txtPath)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", txtPath, err)
-	}
-	defer tf.Close()
-
-	for _, s := range slugs {
-		if _, err := fmt.Fprintln(tf, s); err != nil {
-			return fmt.Errorf("write %s: %w", txtPath, err)
-		}
-	}
-
-	// JSON file
-	jf, err := os.Create(jsonPath)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", jsonPath, err)
-	}
-	defer jf.Close()
-
-	enc := json.NewEncoder(jf)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(slugs); err != nil {
-		return fmt.Errorf("encode %s: %w", jsonPath, err)
-	}
-
-	log.Printf("Wrote %s and %s", txtPath, jsonPath)
-	return nil
-}
-
-//
-// ---------- Local filesystem scanning ----------
-//
-
-func scanLocalForSlugs(root string, workers int) (map[string]struct{}, error) {
-	info, err := os.Stat(root)
-	if err != nil {
-		return nil, fmt.Errorf("stat %s: %w", root, err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("%s is not a directory", root)
-	}
-
-	paths := []string{}
-	if err := filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
+	if srcKind == srcS3 || strings.HasPrefix(*outDir, "s3://") {
+		var err error
+		s3Client, err = newS3Client(ctx)
 		if err != nil {
-			return err
+			log.Fatalf("failed to create S3 client: %v", err)
 		}
-		if !fi.IsDir() && strings.HasSuffix(fi.Name(), ".txt") {
-			paths = append(paths, path)
-		}
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("walk %s: %w", root, err)
 	}
 
-	log.Printf("Found %d local .txt files to scan", len(paths))
-
-	return extractSlugsFromFiles(paths, workers, func(path string) (bufio.Scanner, func() error, error) {
-		f, err := os.Open(path)
+	if srcKind == srcS3 {
+		p, err := parseS3Path(*inputDir)
 		if err != nil {
-			return bufio.Scanner{}, nil, fmt.Errorf("open %s: %w", path, err)
+			log.Fatalf("invalid inputDir %q: %v", *inputDir, err)
 		}
-		sc := *bufio.NewScanner(f)
-		cleanup := func() error { return f.Close() }
-		return sc, cleanup, nil
-	})
+		inS3 = p
+	}
+
+	if strings.HasPrefix(*outDir, "s3://") {
+		p, err := parseS3Path(*outDir)
+		if err != nil {
+			log.Fatalf("invalid outDir %q: %v", *outDir, err)
+		}
+		outS3 = p
+	}
+
+	for {
+		if err := runOnce(ctx, srcKind, s3Client, inS3, outS3); err != nil {
+			log.Fatalf("runOnce failed: %v", err)
+		}
+
+		if *loopEvery == 0 {
+			// one-shot run (current behavior)
+			return
+		}
+
+		log.Printf("Scan complete. Sleeping for %s before next run...", *loopEvery)
+		time.Sleep(*loopEvery)
+	}
 }
 
-//
-// ---------- S3 / R2 scanning ----------
-//
+func runOnce(ctx context.Context, srcKind sourceType, s3Client *s3.Client, inS3, outS3 *s3Path) error {
+	log.Printf("=== Scanning %s for Vine video URLs (S3/R2) ===", *inputDir)
 
-func newS3ClientFromEnv(ctx context.Context, s3URL string) (*s3.Client, string, string, error) {
-	u, err := url.Parse(s3URL)
+	var keys []string
+	var err error
+
+	switch srcKind {
+	case srcS3:
+		if inS3 == nil {
+			return fmt.Errorf("internal error: inS3 nil")
+		}
+		log.Printf("Listing objects in bucket=%s prefix=%s", inS3.Bucket, inS3.Prefix)
+		keys, err = listS3TextObjects(ctx, s3Client, inS3.Bucket, inS3.Prefix)
+	default:
+		log.Printf("Listing local .txt files under %s", *inputDir)
+		keys, err = listLocalTextFiles(*inputDir)
+	}
 	if err != nil {
-		return nil, "", "", fmt.Errorf("parse inputDir %q: %w", s3URL, err)
-	}
-	if u.Scheme != "s3" {
-		return nil, "", "", fmt.Errorf("inputDir must start with s3://, got %q", s3URL)
-	}
-	bucket := u.Host
-	prefix := strings.TrimPrefix(u.Path, "/")
-
-	endpoint := os.Getenv("S3_ENDPOINT")
-	if endpoint == "" {
-		endpoint = os.Getenv("R2_ENDPOINT")
-	}
-	if endpoint == "" {
-		return nil, "", "", fmt.Errorf("S3_ENDPOINT or R2_ENDPOINT env var must be set for R2")
+		return fmt.Errorf("listing input objects: %w", err)
 	}
 
+	log.Printf("Found %d .txt objects in %s", len(keys), sourceName(srcKind))
+
+	slugs := make(map[string]struct{})
+	var mu sync.Mutex
+
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+
+	workerCount := *workers
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for key := range jobs {
+				var content io.ReadCloser
+				var err error
+
+				switch srcKind {
+				case srcS3:
+					content, err = readS3Object(ctx, s3Client, inS3.Bucket, key)
+				default:
+					content, err = readLocalFile(key)
+				}
+				if err != nil {
+					log.Printf("error reading %s: %v", key, err)
+					continue
+				}
+
+				// Always close
+				func() {
+					defer content.Close()
+					fileSlugs := extractVineSlugs(content)
+					if len(fileSlugs) == 0 {
+						return
+					}
+					mu.Lock()
+					for _, s := range fileSlugs {
+						slugs[s] = struct{}{}
+					}
+					mu.Unlock()
+				}()
+			}
+		}()
+	}
+
+	for _, k := range keys {
+		jobs <- k
+	}
+	close(jobs)
+	wg.Wait()
+
+	log.Printf("Collected %d unique Vine slugs", len(slugs))
+
+	if outS3 != nil {
+		return writeSlugsToS3(ctx, s3Client, outS3.Bucket, outS3.Prefix, slugs)
+	}
+	return writeSlugsToLocal(*outDir, slugs)
+}
+
+// --- helpers ---
+
+func detectSource(path string) sourceType {
+	if strings.HasPrefix(path, "s3://") {
+		return srcS3
+	}
+	return srcLocal
+}
+
+func sourceName(s sourceType) string {
+	if s == srcS3 {
+		return "S3/R2"
+	}
+	return "local filesystem"
+}
+
+func parseS3Path(p string) (*s3Path, error) {
+	if !strings.HasPrefix(p, "s3://") {
+		return nil, fmt.Errorf("must start with s3://")
+	}
+	trimmed := strings.TrimPrefix(p, "s3://")
+	parts := strings.SplitN(trimmed, "/", 2)
+	if len(parts) == 0 || parts[0] == "" {
+		return nil, fmt.Errorf("missing bucket in %q", p)
+	}
+	path := &s3Path{Bucket: parts[0]}
+	if len(parts) == 2 {
+		path.Prefix = strings.TrimPrefix(parts[1], "/")
+	}
+	return path, nil
+}
+
+func newS3Client(ctx context.Context) (*s3.Client, error) {
+	endpoint := os.Getenv("AWS_S3_ENDPOINT") // for R2 use e.g. https://<account>.r2.cloudflarestorage.com
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
-		// Cloudflare suggests "auto" but AWS SDK requires something non-empty.
 		region = "auto"
 	}
 
-	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
-	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
-	if accessKey == "" || secretKey == "" {
-		return nil, "", "", fmt.Errorf("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set")
-	}
+	var cfg aws.Config
+	var err error
 
-	cfg, err := awscfg.LoadDefaultConfig(
-		ctx,
-		awscfg.WithRegion(region),
-		awscfg.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
-		awscfg.WithEndpointResolverWithOptions(
-			aws.EndpointResolverWithOptionsFunc(func(service, r string, _ ...any) (aws.Endpoint, error) {
-				// Use the same endpoint for all S3 requests.
+	if endpoint != "" {
+		resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			if service == "s3" {
 				return aws.Endpoint{
-					URL:           endpoint,
-					PartitionID:   "aws",
-					SigningRegion: region,
+					URL:               endpoint,
+					HostnameImmutable: true,
 				}, nil
-			}),
-		),
-	)
+			}
+			return aws.Endpoint{}, &aws.EndpointNotFoundError{}
+		})
+		cfg, err = config.LoadDefaultConfig(ctx,
+			config.WithRegion(region),
+			config.WithEndpointResolverWithOptions(resolver),
+		)
+	} else {
+		cfg, err = config.LoadDefaultConfig(ctx,
+			config.WithRegion(region),
+		)
+	}
 	if err != nil {
-		return nil, "", "", fmt.Errorf("load AWS config: %w", err)
+		return nil, err
 	}
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		// R2 usually wants path-style.
 		o.UsePathStyle = true
 	})
-
-	return client, bucket, prefix, nil
+	return client, nil
 }
 
-func scanS3ForSlugs(ctx context.Context, client *s3.Client, bucket, prefix string, workers int) (map[string]struct{}, error) {
-	log.Printf("Listing objects in bucket=%s prefix=%s", bucket, prefix)
+func listS3TextObjects(ctx context.Context, client *s3.Client, bucket, prefix string) ([]string, error) {
+	var keys []string
+	var token *string
 
-	keys := []string{}
-
-	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: &bucket,
-		Prefix: aws.String(prefix),
-	})
-
-	for pager.HasMorePages() {
-		page, err := pager.NextPage(ctx)
+	for {
+		out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("list objects: %w", err)
+			return nil, err
 		}
-		for _, obj := range page.Contents {
+
+		for _, obj := range out.Contents {
+			if obj.Key == nil {
+				continue
+			}
 			if strings.HasSuffix(*obj.Key, ".txt") {
 				keys = append(keys, *obj.Key)
 			}
 		}
-	}
 
-	log.Printf("Found %d .txt objects in S3/R2", len(keys))
-
-	return extractSlugsFromFiles(keys, workers, func(key string) (bufio.Scanner, func() error, error) {
-		out, err := client.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: &bucket,
-			Key:    &key,
-		})
-		if err != nil {
-			return bufio.Scanner{}, nil, fmt.Errorf("get %s: %w", key, err)
+		if out.IsTruncated && out.NextContinuationToken != nil {
+			token = out.NextContinuationToken
+		} else {
+			break
 		}
-		sc := *bufio.NewScanner(out.Body)
-		cleanup := func() error { return out.Body.Close() }
-		return sc, cleanup, nil
-	})
+	}
+	return keys, nil
 }
 
-//
-// ---------- Shared slug extraction logic ----------
-//
-
-// fileOpener abstracts over local files and S3 objects.
-type fileOpener func(pathOrKey string) (bufio.Scanner, func() error, error)
-
-func extractSlugsFromFiles(paths []string, workers int, open fileOpener) (map[string]struct{}, error) {
-	slugs := make(map[string]struct{})
-	var mu sync.Mutex
-
-	jobs := make(chan string, workers*2)
-	var wg sync.WaitGroup
-	errCh := make(chan error, 1)
-
-	worker := func() {
-		defer wg.Done()
-		for p := range jobs {
-			sc, cleanup, err := open(p)
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-			for sc.Scan() {
-				line := sc.Bytes()
-				matches := vineURLRe.FindAllSubmatch(line, -1)
-				if len(matches) == 0 {
-					continue
-				}
-				mu.Lock()
-				for _, m := range matches {
-					if len(m) > 1 {
-						slugs[string(m[1])] = struct{}{}
-					}
-				}
-				mu.Unlock()
-			}
-			if err := sc.Err(); err != nil {
-				log.Printf("scan error in %s: %v", p, err)
-			}
-			if err := cleanup(); err != nil {
-				log.Printf("cleanup error for %s: %v", p, err)
-			}
-		}
-	}
-
-	if workers < 1 {
-		workers = 1
-	}
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go worker()
-	}
-
-	go func() {
-		for _, p := range paths {
-			jobs <- p
-		}
-		close(jobs)
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case err := <-errCh:
+func readS3Object(ctx context.Context, client *s3.Client, bucket, key string) (io.ReadCloser, error) {
+	out, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
 		return nil, err
-	case <-done:
+	}
+	return out.Body, nil
+}
+
+func listLocalTextFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".txt") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
+}
+
+func readLocalFile(path string) (io.ReadCloser, error) {
+	return os.Open(path)
+}
+
+func extractVineSlugs(r io.Reader) []string {
+	var slugs []string
+	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 0, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024) // up to 10MB per line
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		matches := vineRe.FindAllStringSubmatch(line, -1)
+		for _, m := range matches {
+			if len(m) >= 2 {
+				slugs = append(slugs, m[1])
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("scanner error: %v", err)
+	}
+	return slugs
+}
+
+func writeSlugsToLocal(outRoot string, slugs map[string]struct{}) error {
+	if err := os.MkdirAll(outRoot, 0o755); err != nil {
+		return fmt.Errorf("creating outDir: %w", err)
+	}
+	outPath := filepath.Join(outRoot, "vine_slugs.txt")
+	f, err := os.Create(outPath)
+	if err != nil {
+		return fmt.Errorf("create output file: %w", err)
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	for s := range slugs {
+		if _, err := w.WriteString(s + "\n"); err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	log.Printf("Wrote %d slugs to %s", len(slugs), outPath)
+	return nil
+}
+
+func writeSlugsToS3(ctx context.Context, client *s3.Client, bucket, prefix string, slugs map[string]struct{}) error {
+	var sb strings.Builder
+	for s := range slugs {
+		sb.WriteString(s)
+		sb.WriteString("\n")
 	}
 
-	return slugs, nil
+	key := strings.TrimPrefix(filepath.Join(prefix, "vine_slugs.txt"), "/")
+
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   strings.NewReader(sb.String()),
+	})
+	if err != nil {
+		return fmt.Errorf("put object to s3://%s/%s: %w", bucket, key, err)
+	}
+	log.Printf("Wrote %d slugs to s3://%s/%s", len(slugs), bucket, key)
+	return nil
 }
