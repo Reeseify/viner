@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,16 +15,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // Flags
 var (
-	inputDir    = flag.String("inputDir", "vine_tweets", "Directory OR s3://bucket/prefix containing Vine-Tweets text files")
+	inputDir    = flag.String("inputDir", "vine_tweets", "Directory containing Vine-Tweets text files")
 	outDir      = flag.String("outDir", "vine_archive_harvest", "Output root directory")
 	baseProfile = flag.String("baseProfile", "https://archive.vine.co/profiles", "Base URL for profile JSON (no trailing slash)")
 	basePost    = flag.String("basePost", "https://archive.vine.co/posts", "Base URL for post JSON (no trailing slash)")
@@ -42,10 +36,6 @@ var httpClient = &http.Client{
 		IdleConnTimeout:     90 * time.Second,
 	},
 }
-
-// global rate limiter
-// Tweak this if you want to push harder, e.g. time.Second/10 ≈ 10 req/s
-var rateLimiter = time.Tick(time.Second / 200)
 
 // downloadedMedia keeps us from downloading the same file more than once.
 var downloadedMedia = struct {
@@ -75,7 +65,7 @@ func main() {
 		}
 	}
 
-	// Step 1: scan vine_tweets (local or s3://) for vine.co/v/... slugs
+	// Step 1: scan vine_tweets for vine.co/v/... slugs
 	log.Printf("=== Scanning %s for Vine video URLs ===\n", *inputDir)
 	slugs, err := collectVineSlugs(*inputDir)
 	if err != nil {
@@ -134,18 +124,7 @@ func main() {
 
 // ------------------------ Step 1: scan vine_tweets for slugs ------------------------
 
-// collectVineSlugs decides if we're reading from local disk or S3/R2.
 func collectVineSlugs(root string) ([]string, error) {
-	// If input starts with s3://, treat it as an R2/S3 bucket + prefix.
-	if strings.HasPrefix(root, "s3://") {
-		return collectVineSlugsFromS3(root)
-	}
-	// Otherwise, treat it as a normal local directory on disk.
-	return collectVineSlugsFromFS(root)
-}
-
-// collectVineSlugsFromFS walks a local directory tree and extracts vine.co/v/... slugs.
-func collectVineSlugsFromFS(root string) ([]string, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		return nil, err
@@ -165,9 +144,6 @@ func collectVineSlugsFromFS(root string) ([]string, error) {
 			return nil
 		}
 
-		// You can filter by extension if you want, e.g. only .txt
-		// if !strings.HasSuffix(strings.ToLower(fi.Name()), ".txt") { return nil }
-
 		f, err := os.Open(path)
 		if err != nil {
 			return nil
@@ -181,102 +157,6 @@ func collectVineSlugsFromFS(root string) ([]string, error) {
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	slugs := make([]string, 0, len(slugSet))
-	for s := range slugSet {
-		slugs = append(slugs, s)
-	}
-	return slugs, nil
-}
-
-// collectVineSlugsFromS3 reads objects from an R2/S3 bucket and scans them for vine.co/v/... slugs.
-// The root parameter must look like: s3://bucket-name/prefix
-func collectVineSlugsFromS3(s3URL string) ([]string, error) {
-	u, err := url.Parse(s3URL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid s3 URL %q: %w", s3URL, err)
-	}
-	bucket := u.Host
-	prefix := strings.TrimLeft(u.Path, "/")
-
-	if bucket == "" {
-		return nil, fmt.Errorf("s3 URL must be like s3://bucket/prefix")
-	}
-
-	endpoint := os.Getenv("R2_ENDPOINT")
-	if endpoint == "" {
-		return nil, fmt.Errorf("R2_ENDPOINT env var is required for S3/R2 mode")
-	}
-	accessKey := os.Getenv("R2_ACCESS_KEY_ID")
-	secretKey := os.Getenv("R2_SECRET_ACCESS_KEY")
-	if accessKey == "" || secretKey == "" {
-		return nil, fmt.Errorf("R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY env vars are required for S3/R2 mode")
-	}
-
-	log.Printf("Using R2 bucket=%s prefix=%s endpoint=%s\n", bucket, prefix, endpoint)
-
-	ctx := context.Background()
-
-	// Custom endpoint resolver for R2
-	resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string) (aws.Endpoint, error) {
-		if service == s3.ServiceID {
-			return aws.Endpoint{
-				URL:               endpoint,
-				HostnameImmutable: true,
-			}, nil
-		}
-		return aws.Endpoint{}, &aws.EndpointNotFoundError{}
-	})
-
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion("auto"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
-		config.WithEndpointResolverWithOptions(resolver),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("load AWS config for R2: %w", err)
-	}
-
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-	})
-
-	slugSet := make(map[string]struct{})
-
-	p := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
-	})
-
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list objects: %w", err)
-		}
-
-		for _, obj := range page.Contents {
-			key := aws.ToString(obj.Key)
-			if strings.HasSuffix(key, "/") {
-				continue
-			}
-
-			log.Printf("Scanning R2 object: %s\n", key)
-
-			out, err := client.GetObject(ctx, &s3.GetObjectInput{
-				Bucket: aws.String(bucket),
-				Key:    aws.String(key),
-			})
-			if err != nil {
-				log.Printf("GetObject %s: %v\n", key, err)
-				continue
-			}
-
-			if err := scanSlugsFromReader(out.Body, slugSet); err != nil {
-				log.Printf("scanSlugsFromReader(%s): %v\n", key, err)
-			}
-			out.Body.Close()
-		}
 	}
 
 	slugs := make([]string, 0, len(slugSet))
@@ -475,8 +355,6 @@ func processUser(userID, profilesDir, postsRoot, mediaRoot string, workerID int)
 // ------------------------ HTTP + JSON helpers ------------------------
 
 func fetchJSONMap(u string) (map[string]interface{}, error) {
-	<-rateLimiter
-
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
