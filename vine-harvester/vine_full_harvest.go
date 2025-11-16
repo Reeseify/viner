@@ -2,599 +2,337 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awscfg "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// Flags
-var (
-	inputDir    = flag.String("inputDir", "vine_tweets", "Directory containing Vine-Tweets text files")
-	outDir      = flag.String("outDir", "vine_archive_harvest", "Output root directory")
-	baseProfile = flag.String("baseProfile", "https://archive.vine.co/profiles", "Base URL for profile JSON (no trailing slash)")
-	basePost    = flag.String("basePost", "https://archive.vine.co/posts", "Base URL for post JSON (no trailing slash)")
-	workers     = flag.Int("workers", 128, "Number of concurrent workers")
-	download    = flag.Bool("download", false, "Download media files from vines.s3.amazonaws.com")
-)
-
-// HTTP client (shared)
-var httpClient = &http.Client{
-	Timeout: 15 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 200,
-		IdleConnTimeout:     90 * time.Second,
-	},
-}
-
-// downloadedMedia keeps us from downloading the same file more than once.
-var downloadedMedia = struct {
-	mu sync.Mutex
-	m  map[string]struct{}
-}{m: make(map[string]struct{})}
-
-// regex to extract vine.co/v/<id> slugs
-var vineURLRe = regexp.MustCompile(`vine\.co\/v\/([A-Za-z0-9]+)`)
+// Regex to find Vine video URLs and capture the slug.
+var vineURLRe = regexp.MustCompile(`https?://vine\.co/v/([A-Za-z0-9]+)`)
 
 func main() {
+	inputDir := flag.String("inputDir", "", "Local dir or s3://bucket/prefix/")
+	outDir := flag.String("outDir", "vine_archive_harvest", "Output directory")
+	workers := flag.Int("workers", runtime.NumCPU()*4, "Number of worker goroutines")
+	download := flag.Bool("download", false, "Download videos (not implemented; reserved)")
 	flag.Parse()
 
-	profilesDir := filepath.Join(*outDir, "profiles")
-	postsRoot := filepath.Join(*outDir, "posts")
-	mediaRoot := filepath.Join(*outDir, "media")
+	if *inputDir == "" {
+		log.Fatal("-inputDir is required")
+	}
 
-	if err := os.MkdirAll(profilesDir, 0755); err != nil {
-		log.Fatalf("MkdirAll profilesDir: %v", err)
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		log.Fatalf("create outDir %s: %v", *outDir, err)
 	}
-	if err := os.MkdirAll(postsRoot, 0755); err != nil {
-		log.Fatalf("MkdirAll postsRoot: %v", err)
+
+	start := time.Now()
+
+	var (
+		slugs map[string]struct{}
+		err   error
+	)
+
+	if strings.HasPrefix(*inputDir, "s3://") {
+		// ----- S3 / R2 path -----
+		ctx := context.Background()
+		client, bucket, prefix, errInit := newS3ClientFromEnv(ctx, *inputDir)
+		if errInit != nil {
+			log.Fatalf("init S3 client: %v", errInit)
+		}
+		log.Printf("=== Scanning %s for Vine video URLs (S3/R2) ===", *inputDir)
+		slugs, err = scanS3ForSlugs(ctx, client, bucket, prefix, *workers)
+	} else {
+		// ----- Local filesystem path -----
+		log.Printf("=== Scanning %s for Vine video URLs (local) ===", *inputDir)
+		slugs, err = scanLocalForSlugs(*inputDir, *workers)
 	}
+
+	if err != nil {
+		log.Fatalf("scan failed: %v", err)
+	}
+
+	// Turn map into sorted slice.
+	list := make([]string, 0, len(slugs))
+	for slug := range slugs {
+		list = append(list, slug)
+	}
+	sort.Strings(list)
+
+	if err := writeOutputs(*outDir, list); err != nil {
+		log.Fatalf("write outputs: %v", err)
+	}
+
+	log.Printf("Done. Found %d unique Vine slugs in %s", len(list), time.Since(start))
 	if *download {
-		if err := os.MkdirAll(mediaRoot, 0755); err != nil {
-			log.Fatalf("MkdirAll mediaRoot: %v", err)
+		log.Printf("Note: -download=true is not implemented in this stripped-down harvester.")
+	}
+}
+
+// writeOutputs writes vine_slugs.txt and vine_slugs.json.
+func writeOutputs(outDir string, slugs []string) error {
+	txtPath := filepath.Join(outDir, "vine_slugs.txt")
+	jsonPath := filepath.Join(outDir, "vine_slugs.json")
+
+	// Text file
+	tf, err := os.Create(txtPath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", txtPath, err)
+	}
+	defer tf.Close()
+
+	for _, s := range slugs {
+		if _, err := fmt.Fprintln(tf, s); err != nil {
+			return fmt.Errorf("write %s: %w", txtPath, err)
 		}
 	}
 
-	// Step 1: scan vine_tweets for vine.co/v/... slugs
-	log.Printf("=== Scanning %s for Vine video URLs ===\n", *inputDir)
-	slugs, err := collectVineSlugs(*inputDir)
+	// JSON file
+	jf, err := os.Create(jsonPath)
 	if err != nil {
-		log.Fatalf("collectVineSlugs: %v", err)
+		return fmt.Errorf("create %s: %w", jsonPath, err)
 	}
-	if len(slugs) == 0 {
-		log.Fatalf("No Vine video URLs found in %s", *inputDir)
-	}
-	log.Printf("Collected %d unique Vine video IDs from %s\n", len(slugs), *inputDir)
+	defer jf.Close()
 
-	// Step 2: from those slugs, fetch posts + discover user IDs
-	log.Println("=== Seeding posts and discovering users from slugs ===")
-	userIDs, err := fetchUsersFromSlugs(slugs, postsRoot)
-	if err != nil {
-		log.Fatalf("fetchUsersFromSlugs: %v", err)
-	}
-	if len(userIDs) == 0 {
-		log.Fatalf("No user IDs discovered from Vine tweets")
-	}
-	log.Printf("Discovered %d unique user IDs from vine_tweets\n", len(userIDs))
-
-	// Save discovered user IDs
-	profilesJSONPath := filepath.Join(*outDir, "profiles.json")
-	if err := writeJSONFile(profilesJSONPath, userIDs); err != nil {
-		log.Printf("Warning: failed to write %s: %v\n", profilesJSONPath, err)
-	} else {
-		log.Printf("Wrote discovered user IDs to %s\n", profilesJSONPath)
+	enc := json.NewEncoder(jf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(slugs); err != nil {
+		return fmt.Errorf("encode %s: %w", jsonPath, err)
 	}
 
-	// Step 3: harvest profiles + posts for each user
-	log.Println("=== Harvesting profiles + posts per user ===")
-
-	jobs := make(chan string, *workers*2)
-	var wg sync.WaitGroup
-
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for uid := range jobs {
-				if err := processUser(uid, profilesDir, postsRoot, mediaRoot, workerID); err != nil {
-					log.Printf("[worker %d] user %s: %v\n", workerID, uid, err)
-				}
-			}
-		}(i)
-	}
-
-	for _, uid := range userIDs {
-		jobs <- uid
-	}
-	close(jobs)
-	wg.Wait()
-
-	log.Println("All done.")
+	log.Printf("Wrote %s and %s", txtPath, jsonPath)
+	return nil
 }
 
-// ------------------------ Step 1: scan vine_tweets for slugs ------------------------
+//
+// ---------- Local filesystem scanning ----------
+//
 
-func collectVineSlugs(root string) ([]string, error) {
+func scanLocalForSlugs(root string, workers int) (map[string]struct{}, error) {
 	info, err := os.Stat(root)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("stat %s: %w", root, err)
 	}
 	if !info.IsDir() {
 		return nil, fmt.Errorf("%s is not a directory", root)
 	}
 
-	slugSet := make(map[string]struct{})
-
-	err = filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
+	paths := []string{}
+	if err := filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
-			// skip this entry
-			return nil
+			return err
 		}
-		if fi.IsDir() {
-			return nil
+		if !fi.IsDir() && strings.HasSuffix(fi.Name(), ".txt") {
+			paths = append(paths, path)
 		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("walk %s: %w", root, err)
+	}
 
+	log.Printf("Found %d local .txt files to scan", len(paths))
+
+	return extractSlugsFromFiles(paths, workers, func(path string) (bufio.Scanner, func() error, error) {
 		f, err := os.Open(path)
 		if err != nil {
-			return nil
+			return bufio.Scanner{}, nil, fmt.Errorf("open %s: %w", path, err)
 		}
-		defer f.Close()
-
-		if err := scanSlugsFromReader(f, slugSet); err != nil {
-			log.Printf("scanSlugsFromReader(%s): %v\n", path, err)
-		}
-		return nil
+		sc := *bufio.NewScanner(f)
+		cleanup := func() error { return f.Close() }
+		return sc, cleanup, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	slugs := make([]string, 0, len(slugSet))
-	for s := range slugSet {
-		slugs = append(slugs, s)
-	}
-	return slugs, nil
 }
 
-// scanSlugsFromReader pulls vine.co/v/... slugs out of an arbitrary text stream.
-func scanSlugsFromReader(r io.Reader, slugSet map[string]struct{}) error {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := scanner.Text()
-		matches := vineURLRe.FindAllStringSubmatch(line, -1)
-		for _, m := range matches {
-			if len(m) >= 2 {
-				slug := strings.TrimSpace(m[1])
-				if slug != "" {
-					slugSet[slug] = struct{}{}
-				}
+//
+// ---------- S3 / R2 scanning ----------
+//
+
+func newS3ClientFromEnv(ctx context.Context, s3URL string) (*s3.Client, string, string, error) {
+	u, err := url.Parse(s3URL)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("parse inputDir %q: %w", s3URL, err)
+	}
+	if u.Scheme != "s3" {
+		return nil, "", "", fmt.Errorf("inputDir must start with s3://, got %q", s3URL)
+	}
+	bucket := u.Host
+	prefix := strings.TrimPrefix(u.Path, "/")
+
+	endpoint := os.Getenv("S3_ENDPOINT")
+	if endpoint == "" {
+		endpoint = os.Getenv("R2_ENDPOINT")
+	}
+	if endpoint == "" {
+		return nil, "", "", fmt.Errorf("S3_ENDPOINT or R2_ENDPOINT env var must be set for R2")
+	}
+
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		// Cloudflare suggests "auto" but AWS SDK requires something non-empty.
+		region = "auto"
+	}
+
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if accessKey == "" || secretKey == "" {
+		return nil, "", "", fmt.Errorf("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set")
+	}
+
+	cfg, err := awscfg.LoadDefaultConfig(
+		ctx,
+		awscfg.WithRegion(region),
+		awscfg.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+		awscfg.WithEndpointResolverWithOptions(
+			aws.EndpointResolverWithOptionsFunc(func(service, r string, _ ...any) (aws.Endpoint, error) {
+				// Use the same endpoint for all S3 requests.
+				return aws.Endpoint{
+					URL:           endpoint,
+					PartitionID:   "aws",
+					SigningRegion: region,
+				}, nil
+			}),
+		),
+	)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("load AWS config: %w", err)
+	}
+
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// R2 usually wants path-style.
+		o.UsePathStyle = true
+	})
+
+	return client, bucket, prefix, nil
+}
+
+func scanS3ForSlugs(ctx context.Context, client *s3.Client, bucket, prefix string, workers int) (map[string]struct{}, error) {
+	log.Printf("Listing objects in bucket=%s prefix=%s", bucket, prefix)
+
+	keys := []string{}
+
+	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: &bucket,
+		Prefix: aws.String(prefix),
+	})
+
+	for pager.HasMorePages() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list objects: %w", err)
+		}
+		for _, obj := range page.Contents {
+			if strings.HasSuffix(*obj.Key, ".txt") {
+				keys = append(keys, *obj.Key)
 			}
 		}
 	}
-	return scanner.Err()
+
+	log.Printf("Found %d .txt objects in S3/R2", len(keys))
+
+	return extractSlugsFromFiles(keys, workers, func(key string) (bufio.Scanner, func() error, error) {
+		out, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &key,
+		})
+		if err != nil {
+			return bufio.Scanner{}, nil, fmt.Errorf("get %s: %w", key, err)
+		}
+		sc := *bufio.NewScanner(out.Body)
+		cleanup := func() error { return out.Body.Close() }
+		return sc, cleanup, nil
+	})
 }
 
-// ------------------------ Step 2: from slugs → posts + user IDs ------------------------
+//
+// ---------- Shared slug extraction logic ----------
+//
 
-func fetchUsersFromSlugs(slugs []string, postsRoot string) ([]string, error) {
-	userSet := make(map[string]struct{})
-	var userMu sync.Mutex
+// fileOpener abstracts over local files and S3 objects.
+type fileOpener func(pathOrKey string) (bufio.Scanner, func() error, error)
 
-	jobs := make(chan string, *workers*2)
+func extractSlugsFromFiles(paths []string, workers int, open fileOpener) (map[string]struct{}, error) {
+	slugs := make(map[string]struct{})
+	var mu sync.Mutex
+
+	jobs := make(chan string, workers*2)
 	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
 
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for slug := range jobs {
-				postURL := fmt.Sprintf("%s/%s.json", strings.TrimRight(*basePost, "/"), url.PathEscape(slug))
-
-				postData, err := fetchJSONMap(postURL)
-				if err != nil {
-					log.Printf("[seed worker %d] post slug %s: %v\n", workerID, slug, err)
-					continue
-				}
-
-				// Rewrite URLs
-				postData = rewriteURLs(postData).(map[string]interface{})
-
-				// Extract userId
-				userID := ""
-				if v, ok := postData["userIdStr"].(string); ok && v != "" {
-					userID = v
-				} else if f, ok := postData["userId"].(float64); ok {
-					userID = fmt.Sprintf("%.0f", f)
-				}
-
-				// Extract real post ID
-				realID := ""
-				if v, ok := postData["postIdStr"].(string); ok && v != "" {
-					realID = v
-				} else if f, ok := postData["postId"].(float64); ok {
-					realID = fmt.Sprintf("%.0f", f)
-				} else {
-					realID = slug
-				}
-
-				if userID == "" {
-					continue
-				}
-
-				// Record userID
-				userMu.Lock()
-				if _, exists := userSet[userID]; !exists {
-					userSet[userID] = struct{}{}
-				}
-				userMu.Unlock()
-
-				// Save this post immediately under user
-				userPostsDir := filepath.Join(postsRoot, userID)
-				if err := os.MkdirAll(userPostsDir, 0755); err != nil {
-					log.Printf("[seed worker %d] MkdirAll posts dir for %s: %v\n", workerID, userID, err)
-					continue
-				}
-				postFile := filepath.Join(userPostsDir, realID+".json")
-				if !fileExists(postFile) {
-					if err := writeJSONFile(postFile, postData); err != nil {
-						log.Printf("[seed worker %d] write seed post %s for user %s: %v\n",
-							workerID, realID, userID, err)
-					}
-				}
-			}
-		}(i)
-	}
-
-	for _, slug := range slugs {
-		jobs <- slug
-	}
-	close(jobs)
-	wg.Wait()
-
-	userIDs := make([]string, 0, len(userSet))
-	for uid := range userSet {
-		userIDs = append(userIDs, uid)
-	}
-	return userIDs, nil
-}
-
-// ------------------------ Step 3: per-user profile + posts ------------------------
-
-func processUser(userID, profilesDir, postsRoot, mediaRoot string, workerID int) error {
-	// 1) Ensure profile JSON exists
-	profilePath := filepath.Join(profilesDir, userID+".json")
-	if !fileExists(profilePath) {
-		profileURL := fmt.Sprintf("%s/%s.json", strings.TrimRight(*baseProfile, "/"), url.PathEscape(userID))
-		profile, err := fetchJSONMap(profileURL)
-		if err != nil {
-			return fmt.Errorf("fetch profile: %w", err)
-		}
-		// Rewrite URLs in profile
-		profile = rewriteURLs(profile).(map[string]interface{})
-
-		if err := writeJSONFile(profilePath, profile); err != nil {
-			return fmt.Errorf("write profile JSON: %w", err)
-		}
-	}
-
-	// 2) Load profile to get post IDs
-	raw, err := os.ReadFile(profilePath)
-	if err != nil {
-		return fmt.Errorf("read profile JSON: %w", err)
-	}
-	var profile map[string]interface{}
-	if err := json.Unmarshal(raw, &profile); err != nil {
-		return fmt.Errorf("decode profile JSON: %w", err)
-	}
-
-	postIDs := collectPostIDsFromProfile(profile)
-	if len(postIDs) == 0 {
-		log.Printf("[worker %d] user %s: no post IDs in profile\n", workerID, userID)
-		return nil
-	}
-
-	userPostsDir := filepath.Join(postsRoot, userID)
-	if err := os.MkdirAll(userPostsDir, 0755); err != nil {
-		return fmt.Errorf("MkdirAll userPostsDir: %w", err)
-	}
-
-	for _, pid := range postIDs {
-		postURL := fmt.Sprintf("%s/%s.json", strings.TrimRight(*basePost, "/"), url.PathEscape(pid))
-
-		postData, err := fetchJSONMap(postURL)
-		if err != nil {
-			log.Printf("[worker %d] user %s post %s: %v\n", workerID, userID, pid, err)
-			continue
-		}
-
-		// Extract real post ID
-		realID := ""
-		if v, ok := postData["postIdStr"].(string); ok && v != "" {
-			realID = v
-		} else if f, ok := postData["postId"].(float64); ok {
-			realID = fmt.Sprintf("%.0f", f)
-		} else {
-			realID = pid
-		}
-
-		postFile := filepath.Join(userPostsDir, realID+".json")
-		if fileExists(postFile) {
-			continue
-		}
-
-		postData = rewriteURLs(postData).(map[string]interface{})
-
-		if err := writeJSONFile(postFile, postData); err != nil {
-			log.Printf("[worker %d] user %s post %s write: %v\n", workerID, userID, realID, err)
-		}
-
-		if *download {
-			mediaURLs := collectMediaURLs(postData)
-			for _, mu := range mediaURLs {
-				if err := downloadMedia(mu, mediaRoot); err != nil {
-					log.Printf("[worker %d] user %s post %s media %s: %v\n",
-						workerID, userID, realID, mu, err)
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// ------------------------ HTTP + JSON helpers ------------------------
-
-func fetchJSONMap(u string) (map[string]interface{}, error) {
-	req, err := http.NewRequest("GET", u, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "VineFullHarvester/1.0")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, resp.Body)
-		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, u)
-	}
-
-	var out map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func writeJSONFile(path string, v interface{}) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-// ------------------------ URL rewriting ------------------------
-
-func rewriteURLs(v interface{}) interface{} {
-	switch t := v.(type) {
-	case map[string]interface{}:
-		for k, vv := range t {
-			t[k] = rewriteURLs(vv)
-		}
-		return t
-	case []interface{}:
-		for i, vv := range t {
-			t[i] = rewriteURLs(vv)
-		}
-		return t
-	case string:
-		s := t
-		// Normalize Vine CDN URLs to vines.s3.amazonaws.com
-		if strings.Contains(s, "v.cdn.vine.co") || strings.Contains(s, "mtc.cdn.vine.co") {
-			s = strings.ReplaceAll(s, "http://v.cdn.vine.co", "https://vines.s3.amazonaws.com")
-			s = strings.ReplaceAll(s, "https://v.cdn.vine.co", "https://vines.s3.amazonaws.com")
-			s = strings.ReplaceAll(s, "http://mtc.cdn.vine.co", "https://vines.s3.amazonaws.com")
-			s = strings.ReplaceAll(s, "https://mtc.cdn.vine.co", "https://vines.s3.amazonaws.com")
-		}
-		return s
-	default:
-		return v
-	}
-}
-
-// ------------------------ postId collection ------------------------
-
-func collectPostIDsFromProfile(profile map[string]interface{}) []string {
-	seen := make(map[string]struct{})
-	var out []string
-
-	addID := func(id string) {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			return
-		}
-		if _, ok := seen[id]; ok {
-			return
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-
-	// 1) Preferred: profile["posts"] list
-	if rawPosts, ok := profile["posts"]; ok && rawPosts != nil {
-		switch v := rawPosts.(type) {
-		case []interface{}:
-			for _, item := range v {
-				switch t := item.(type) {
-				case string:
-					addID(t)
-				case float64:
-					addID(fmt.Sprintf("%.0f", t))
-				case map[string]interface{}:
-					if s, ok2 := t["postIdStr"].(string); ok2 && s != "" {
-						addID(s)
-					} else if f, ok2 := t["postId"].(float64); ok2 {
-						addID(fmt.Sprintf("%.0f", f))
-					}
+	worker := func() {
+		defer wg.Done()
+		for p := range jobs {
+			sc, cleanup, err := open(p)
+			if err != nil {
+				select {
+				case errCh <- err:
 				default:
-					// ignore
 				}
+				return
 			}
-		}
-	}
-
-	// 2) Fallback: deep scan for postId/postIdStr anywhere
-	if len(out) == 0 {
-		var walk func(v interface{})
-		walk = func(v interface{}) {
-			switch t := v.(type) {
-			case map[string]interface{}:
-				for k, vv := range t {
-					kl := strings.ToLower(k)
-					if (kl == "postid" || kl == "postidstr") && vv != nil {
-						switch idv := vv.(type) {
-						case string:
-							addID(idv)
-						case float64:
-							addID(fmt.Sprintf("%.0f", idv))
-						}
+			for sc.Scan() {
+				line := sc.Bytes()
+				matches := vineURLRe.FindAllSubmatch(line, -1)
+				if len(matches) == 0 {
+					continue
+				}
+				mu.Lock()
+				for _, m := range matches {
+					if len(m) > 1 {
+						slugs[string(m[1])] = struct{}{}
 					}
-					walk(vv)
 				}
-			case []interface{}:
-				for _, vv := range t {
-					walk(vv)
-				}
-			default:
-				// nothing
+				mu.Unlock()
 			}
-		}
-		walk(profile)
-	}
-
-	return out
-}
-
-// ------------------------ media collection + download ------------------------
-
-func collectMediaURLs(v interface{}) []string {
-	var urls []string
-
-	var walk func(v interface{})
-	walk = func(v interface{}) {
-		switch t := v.(type) {
-		case map[string]interface{}:
-			for _, vv := range t {
-				walk(vv)
+			if err := sc.Err(); err != nil {
+				log.Printf("scan error in %s: %v", p, err)
 			}
-		case []interface{}:
-			for _, vv := range t {
-				walk(vv)
+			if err := cleanup(); err != nil {
+				log.Printf("cleanup error for %s: %v", p, err)
 			}
-		case string:
-			s := t
-			if strings.Contains(s, "vines.s3.amazonaws.com") {
-				if strings.Contains(s, ".mp4") || strings.Contains(s, ".jpg") ||
-					strings.Contains(s, ".jpeg") || strings.Contains(s, ".png") ||
-					strings.Contains(s, ".gif") {
-					urls = append(urls, s)
-				}
-			}
-		default:
-			// ignore
 		}
 	}
 
-	walk(v)
-	return urls
-}
-
-func downloadMedia(rawURL, mediaRoot string) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return err
+	if workers < 1 {
+		workers = 1
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker()
 	}
 
-	// ensure we don't download the same file more than once
-	downloadedMedia.mu.Lock()
-	if _, ok := downloadedMedia.m[rawURL]; ok {
-		downloadedMedia.mu.Unlock()
-		return nil
-	}
-	downloadedMedia.m[rawURL] = struct{}{}
-	downloadedMedia.mu.Unlock()
+	go func() {
+		for _, p := range paths {
+			jobs <- p
+		}
+		close(jobs)
+	}()
 
-	cleanPath := strings.TrimLeft(parsed.Path, "/")
-	localPath := filepath.Join(mediaRoot, cleanPath)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 
-	if fileExists(localPath) {
-		return nil
-	}
-
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest("GET", rawURL, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "VineFullHarvesterMedia/1.0")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, resp.Body)
-		return fmt.Errorf("media HTTP %d", resp.StatusCode)
+	select {
+	case err := <-errCh:
+		return nil, err
+	case <-done:
 	}
 
-	tmp := localPath + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, localPath)
+	return slugs, nil
 }
