@@ -1,7 +1,7 @@
-// server.js
+// index.js (R2-backed API server)
 //
-// Fast server backed by a prebuilt index (data/posts_index.json)
-// instead of scanning all JSON files on startup.
+// Fast server backed by a prebuilt index stored in R2 (data/posts_index.json)
+// instead of scanning all JSON files on local disk.
 //
 // APIs:
 //   GET /api/users
@@ -11,25 +11,77 @@
 //   GET /api/users/:userId/posts/:postId
 //   GET /api/lookup/post/:postId
 //
-// All post JSON files are still served from vine_archive_harvest/posts/<userId>/<postId>.json
+// All post JSON files are read from R2 at:
+//   data/posts/<userId>/<postId>.json
+//
+// Required environment variables:
+//   R2_ENDPOINT
+//   R2_BUCKET
+//   R2_ACCESS_KEY_ID
+//   R2_SECRET_ACCESS_KEY
+// Optional:
+//   R2_DATA_PREFIX  (default: "data")
 
 const http = require("http");
-const fsp = require("fs/promises");
-const fs = require("fs");
 const path = require("path");
 const url = require("url");
+const fs = require("fs");
+const fsp = require("fs/promises");
+const { Readable } = require("stream");
+const {
+    S3Client,
+    GetObjectCommand,
+} = require("@aws-sdk/client-s3");
 
-const PORT = 3000;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+
+// --- R2 config ---
+
+const R2_ENDPOINT = process.env.R2_ENDPOINT;
+const R2_BUCKET = process.env.R2_BUCKET || "viner";
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_DATA_PREFIX = (process.env.R2_DATA_PREFIX || "data").replace(/^\/+|\/+$/g, "");
+
+if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
+    console.error("Missing required R2 env vars. Need R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY");
+    process.exit(1);
+}
+
+const s3 = new S3Client({
+    region: "auto",
+    endpoint: R2_ENDPOINT,
+    credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY,
+    },
+    forcePathStyle: true,
+});
+
+function joinKey(...parts) {
+    return parts
+        .filter(Boolean)
+        .map((p) => String(p).replace(/^\/+|\/+$/g, ""))
+        .join("/");
+}
+
+async function streamToString(body) {
+    if (typeof body === "string") return body;
+    const chunks = [];
+    for await (const chunk of Readable.from(body)) {
+        chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
+
+// --- Local static/public paths ---
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
-const DATA_DIR = path.join(ROOT, "data");
-const POSTS_ROOT = path.join(ROOT, "vine_archive_harvest", "posts");
-const INDEX_FILE = path.join(DATA_DIR, "posts_index.json");
+
+// ---- In-memory index structures ----
 
 /**
- * In-memory structures built from posts_index.json
- *
  * usersIndex: {
  *   [userId]: {
  *     userId,
@@ -44,7 +96,7 @@ const INDEX_FILE = path.join(DATA_DIR, "posts_index.json");
  * postIdIndex: Map<postId, PostMeta>
  */
 
-const usersIndex = Object.create(null);
+let usersIndex = {};
 let allPosts = [];
 const postIdIndex = new Map();
 
@@ -62,58 +114,76 @@ function sendJSON(res, status, data) {
 function sendText(res, status, text) {
     res.writeHead(status, {
         "Content-Type": "text/plain; charset=utf-8",
+        "Content-Length": Buffer.byteLength(text),
     });
     res.end(text);
 }
 
-async function sendIndexHtml(res) {
-    try {
-        const indexPath = path.join(PUBLIC_DIR, "index.html");
-        const data = await fsp.readFile(indexPath);
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(data);
-    } catch (e) {
-        sendText(res, 500, "index.html not found");
-    }
-}
-
 async function serveStatic(req, res, pathname) {
-    let filePath = path.join(PUBLIC_DIR, pathname);
+    let filePath = path.join(PUBLIC_DIR, pathname.replace(/^\/+/, ""));
+    if (pathname === "/" || pathname === "") {
+        filePath = path.join(PUBLIC_DIR, "index.html");
+    }
+
     try {
         const stat = await fsp.stat(filePath);
-        if (stat.isDirectory()) {
-            filePath = path.join(filePath, "index.html");
+        if (!stat.isFile()) {
+            return false;
         }
-        const ext = path.extname(filePath).toLowerCase();
-        let type = "text/plain; charset=utf-8";
-        if (ext === ".html") type = "text/html; charset=utf-8";
-        else if (ext === ".js") type = "text/javascript; charset=utf-8";
-        else if (ext === ".css") type = "text/css; charset=utf-8";
-
-        const data = await fsp.readFile(filePath);
-        res.writeHead(200, { "Content-Type": type });
-        res.end(data);
+        const stream = fs.createReadStream(filePath);
+        res.writeHead(200, { "Content-Type": guessContentType(filePath) });
+        stream.pipe(res);
+        return true;
     } catch {
-        return sendIndexHtml(res);
+        return false;
     }
 }
 
-// ------------ Index loader (FAST) ------------
+function guessContentType(p) {
+    const ext = path.extname(p).toLowerCase();
+    if (ext === ".html" || ext === ".htm") return "text/html; charset=utf-8";
+    if (ext === ".js") return "text/javascript; charset=utf-8";
+    if (ext === ".css") return "text/css; charset=utf-8";
+    if (ext === ".json") return "application/json; charset=utf-8";
+    if (ext === ".png") return "image/png";
+    if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+    if (ext === ".gif") return "image/gif";
+    return "application/octet-stream";
+}
+
+// ------------ Load index from R2 ------------
 
 async function loadIndex() {
-    console.log("Loading index:", INDEX_FILE);
-    const exists = fs.existsSync(INDEX_FILE);
-    if (!exists) {
+    const indexKey = joinKey(R2_DATA_PREFIX, "posts_index.json");
+    console.log("Loading index from R2 object:", indexKey);
+
+    let body;
+    try {
+        const resp = await s3.send(
+            new GetObjectCommand({
+                Bucket: R2_BUCKET,
+                Key: indexKey,
+            })
+        );
+        body = await streamToString(resp.Body);
+    } catch (e) {
         throw new Error(
-            `Index file not found: ${INDEX_FILE}\nRun: node build_index.js`
+            `Index file not found in R2 at ${indexKey}\nMake sure build_index.js has been run. (${e.message})`
         );
     }
 
-    const raw = await fsp.readFile(INDEX_FILE, "utf8");
     /** @type {Array} */
-    const posts = JSON.parse(raw);
+    let posts;
+    try {
+        posts = JSON.parse(body);
+    } catch (e) {
+        throw new Error("Failed to parse posts_index.json from R2: " + e.message);
+    }
+
     allPosts = [];
+    usersIndex = {};
     postIdIndex.clear();
+
     for (const p of posts) {
         const userId = String(p.userId);
         const postId = String(p.postId);
@@ -135,150 +205,144 @@ async function loadIndex() {
         }
         u.posts.push(p);
 
-        // global structures
-        allPosts.push(p);
         postIdIndex.set(postId, p);
+        allPosts.push(p);
     }
 
-    // fix postCount and per-user sorting (oldest → newest)
-    for (const userId of Object.keys(usersIndex)) {
-        const u = usersIndex[userId];
-        u.posts.sort((a, b) => (a.createdTs || 0) - (b.createdTs || 0));
+    // Sort posts per user oldest → newest
+    for (const u of Object.values(usersIndex)) {
+        u.posts.sort((a, b) => a.createdTs - b.createdTs);
         u.postCount = u.posts.length;
     }
 
-    // allPosts already sorted newest→oldest when build_index.js wrote it,
-    // but if you want to be safe:
-    allPosts.sort((a, b) => (b.createdTs || 0) - (a.createdTs || 0));
+    // allPosts is already newest → oldest from build_index.js,
+    // but we can ensure:
+    allPosts.sort((a, b) => b.createdTs - a.createdTs);
 
     console.log(
-        "Loaded index:",
-        Object.keys(usersIndex).length,
-        "users,",
-        allPosts.length,
-        "posts"
+        `Loaded index from R2: ${Object.keys(usersIndex).length} users, ${allPosts.length} posts`
     );
 }
 
-// ------------ API handlers ------------
+// ------------ Fetch single post JSON from R2 ------------
 
-async function handleApi(req, res, pathname, query) {
-    // /api/users
-    if (pathname === "/api/users" && req.method === "GET") {
-        const users = Object.values(usersIndex).map((u) => ({
-            userId: u.userId,
-            username: u.username,
-            postCount: u.postCount,
-        }));
-        return sendJSON(res, 200, users);
-    }
+async function fetchPostJson(userId, postId) {
+    const numericPostId = postId.replace(/[^0-9]/g, "");
+    const key = joinKey(R2_DATA_PREFIX, "posts", userId, numericPostId + ".json");
 
-    // /api/feed?limit=100
-    if (pathname === "/api/feed" && req.method === "GET") {
-        let limit = 100;
-        if (query && typeof query.limit !== "undefined") {
-            const n = parseInt(query.limit, 10);
-            if (!isNaN(n) && n > 0) {
-                limit = Math.min(n, 500);
-            }
-        }
-        return sendJSON(res, 200, allPosts.slice(0, limit));
-    }
-
-    // /api/search?q=term  (search title + username)
-    if (pathname === "/api/search" && req.method === "GET") {
-        const q = (query && query.q ? String(query.q) : "").trim();
-        if (!q) {
-            return sendJSON(res, 400, { error: "Missing q" });
-        }
-        const needle = q.toLowerCase();
-        const results = [];
-        for (const p of allPosts) {
-            if (results.length >= 200) break;
-            const desc = (p.description || "").toLowerCase();
-            const user = (p.username || "").toLowerCase();
-            if (desc.includes(needle) || user.includes(needle)) {
-                results.push(p);
-            }
-        }
-        return sendJSON(res, 200, results);
-    }
-
-    // /api/users/:userId/posts
-    const userPostsMatch = pathname.match(/^\/api\/users\/([^/]+)\/posts$/);
-    if (userPostsMatch && req.method === "GET") {
-        const userId = decodeURIComponent(userPostsMatch[1]);
-        const user = usersIndex[userId];
-        if (!user) return sendText(res, 404, "User not found");
-        return sendJSON(res, 200, user.posts);
-    }
-
-    // /api/users/:userId/posts/:postId  (full JSON from disk)
-    const postMatch = pathname.match(/^\/api\/users\/([^/]+)\/posts\/([^/]+)$/);
-    if (postMatch && req.method === "GET") {
-        const userId = decodeURIComponent(postMatch[1]);
-        const postId = decodeURIComponent(postMatch[2]);
-        const postPath = path.join(
-            POSTS_ROOT,
-            userId,
-            postId.replace(/[^0-9]/g, "") + ".json"
+    try {
+        const resp = await s3.send(
+            new GetObjectCommand({
+                Bucket: R2_BUCKET,
+                Key: key,
+            })
         );
-
-        try {
-            const raw = await fsp.readFile(postPath, "utf8");
-            const json = JSON.parse(raw);
-            return sendJSON(res, 200, json);
-        } catch (e) {
-            console.error("Error reading post JSON:", e.message);
-            return sendText(res, 404, "Post not found");
-        }
+        const body = await streamToString(resp.Body);
+        return JSON.parse(body);
+    } catch (e) {
+        console.error("Error reading post JSON from R2:", key, e.message);
+        return null;
     }
-
-    // /api/watch/:postId  -> full JSON for a vine by ID (no userId needed)
-    const watchMatch = pathname.match(/^\/api\/watch\/([^/]+)$/);
-    if (watchMatch && req.method === "GET") {
-        const postId = decodeURIComponent(watchMatch[1]);
-        const rec = postIdIndex.get(postId);
-        if (!rec) {
-            return sendText(res, 404, "Post not found");
-        }
-
-        const userId = String(rec.userId);
-        const postPath = path.join(
-            POSTS_ROOT,
-            userId,
-            postId.replace(/[^0-9]/g, "") + ".json"
-        );
-
-        try {
-            const raw = await fsp.readFile(postPath, "utf8");
-            const json = JSON.parse(raw);
-            return sendJSON(res, 200, json);
-        } catch (e) {
-            console.error("Error reading watch JSON:", e.message);
-            return sendText(res, 404, "Post not found");
-        }
-    }
-
-
-    return sendText(res, 404, "Not found");
 }
 
 // ------------ HTTP server ------------
 
 const server = http.createServer(async (req, res) => {
-    try {
-        const parsed = url.parse(req.url, true);
-        const pathname = parsed.pathname || "/";
+    const parsed = url.parse(req.url || "", true);
+    const pathname = parsed.pathname || "/";
 
-        if (pathname.startsWith("/api/")) {
-            return handleApi(req, res, pathname, parsed.query);
+    // Basic healthcheck
+    if (pathname === "/healthz") {
+        return sendText(res, 200, "ok");
+    }
+
+    // Try static assets first (public/)
+    if (await serveStatic(req, res, pathname)) {
+        return;
+    }
+
+    // API routes
+    if (pathname.startsWith("/api/")) {
+        // /api/users
+        if (pathname === "/api/users" && req.method === "GET") {
+            const users = Object.values(usersIndex).map((u) => ({
+                userId: u.userId,
+                username: u.username,
+                postCount: u.postCount,
+            }));
+            return sendJSON(res, 200, users);
         }
 
-        return serveStatic(req, res, pathname);
-    } catch (e) {
-        console.error("Server error:", e);
-        sendText(res, 500, "Internal server error");
+        // /api/feed?limit=100
+        if (pathname === "/api/feed" && req.method === "GET") {
+            let limit = Number(parsed.query.limit || 100);
+            if (!Number.isFinite(limit) || limit <= 0) limit = 100;
+            if (limit > 500) limit = 500;
+            return sendJSON(res, 200, allPosts.slice(0, limit));
+        }
+
+        // /api/search?q=term
+        if (pathname === "/api/search" && req.method === "GET") {
+            const q = String(parsed.query.q || "").trim().toLowerCase();
+            if (!q) return sendJSON(res, 200, []);
+
+            const results = allPosts.filter((p) => {
+                const hay =
+                    (p.description || "") +
+                    " " +
+                    (p.username || "") +
+                    " " +
+                    (p.userId || "");
+                return hay.toLowerCase().includes(q);
+            });
+
+            return sendJSON(res, 200, results.slice(0, 200));
+        }
+
+        // /api/users/:userId/posts
+        const userPostsMatch = pathname.match(/^\/api\/users\/([^/]+)\/posts$/);
+        if (userPostsMatch && req.method === "GET") {
+            const userId = decodeURIComponent(userPostsMatch[1]);
+            const user = usersIndex[userId];
+            if (!user) return sendText(res, 404, "User not found");
+            return sendJSON(res, 200, user.posts);
+        }
+
+        // /api/users/:userId/posts/:postId  (full JSON from R2)
+        const postMatch = pathname.match(/^\/api\/users\/([^/]+)\/posts\/([^/]+)$/);
+        if (postMatch && req.method === "GET") {
+            const userId = decodeURIComponent(postMatch[1]);
+            const postId = decodeURIComponent(postMatch[2]);
+
+            const json = await fetchPostJson(userId, postId);
+            if (!json) return sendText(res, 404, "Post not found");
+            return sendJSON(res, 200, json);
+        }
+
+        // /api/lookup/post/:postId  (full JSON from R2, lookup by index first)
+        const lookupMatch = pathname.match(/^\/api\/lookup\/post\/([^/]+)$/);
+        if (lookupMatch && req.method === "GET") {
+            const postId = decodeURIComponent(lookupMatch[1]);
+            const rec = postIdIndex.get(String(postId));
+            if (!rec) return sendText(res, 404, "Post not found in index");
+            const userId = String(rec.userId);
+
+            const json = await fetchPostJson(userId, postId);
+            if (!json) return sendText(res, 404, "Post not found");
+            return sendJSON(res, 200, json);
+        }
+
+        // unknown API
+        return sendText(res, 404, "Not found");
+    }
+
+    // Fallback: serve index.html for any non-API route (SPA style)
+    try {
+        const indexHtml = await fsp.readFile(path.join(PUBLIC_DIR, "index.html"), "utf8");
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(indexHtml);
+    } catch {
+        return sendText(res, 404, "Not found");
     }
 });
 
