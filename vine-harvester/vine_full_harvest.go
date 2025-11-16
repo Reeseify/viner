@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -41,6 +42,14 @@ type s3Path struct {
 	Bucket string
 	Prefix string
 }
+
+func getenvDefault(key, def string) string {
+    if v := os.Getenv(key); v != "" {
+        return v
+    }
+    return def
+}
+
 
 func main() {
 	flag.Parse()
@@ -211,44 +220,45 @@ func parseS3Path(p string) (*s3Path, error) {
 	return path, nil
 }
 
-func newS3Client(ctx context.Context) (*s3.Client, error) {
-	endpoint := os.Getenv("AWS_S3_ENDPOINT") // for R2 use e.g. https://<account>.r2.cloudflarestorage.com
-	region := os.Getenv("AWS_REGION")
-	if region == "" {
-		region = "auto"
-	}
+func newS3Client() *s3.Client {
+    region := getenvDefault("AWS_REGION", "auto")
 
-	var cfg aws.Config
-	var err error
+    accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+    secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+    endpoint := os.Getenv("S3_ENDPOINT") // <-- will point to Cloudflare R2
 
-	if endpoint != "" {
-		resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			if service == "s3" {
-				return aws.Endpoint{
-					URL:               endpoint,
-					HostnameImmutable: true,
-				}, nil
-			}
-			return aws.Endpoint{}, &aws.EndpointNotFoundError{}
-		})
-		cfg, err = config.LoadDefaultConfig(ctx,
-			config.WithRegion(region),
-			config.WithEndpointResolverWithOptions(resolver),
-		)
-	} else {
-		cfg, err = config.LoadDefaultConfig(ctx,
-			config.WithRegion(region),
-		)
-	}
-	if err != nil {
-		return nil, err
-	}
+    if accessKey == "" || secretKey == "" || endpoint == "" {
+        log.Fatalf("AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and S3_ENDPOINT must be set for S3/R2 access")
+    }
 
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-	})
-	return client, nil
+    cfg, err := config.LoadDefaultConfig(
+        context.TODO(),
+        config.WithRegion(region),
+        config.WithCredentialsProvider(
+            credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
+        ),
+        config.WithEndpointResolverWithOptions(
+            aws.EndpointResolverWithOptionsFunc(
+                func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+                    if service == s3.ServiceID {
+                        return aws.Endpoint{
+                            URL:               endpoint,
+                            HostnameImmutable: true,
+                        }, nil
+                    }
+                    return aws.Endpoint{}, &aws.EndpointNotFoundError{}
+                },
+            ),
+        ),
+    )
+    if err != nil {
+        log.Fatalf("failed to load AWS config: %v", err)
+    }
+
+	s3Client := newS3Client()
+    return s3Client
 }
+
 
 func listS3TextObjects(ctx context.Context, client *s3.Client, bucket, prefix string) ([]string, error) {
 	var keys []string
