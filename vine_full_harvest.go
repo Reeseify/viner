@@ -37,10 +37,6 @@ var httpClient = &http.Client{
 	},
 }
 
-// global rate limiter
-// Tweak this if you want to push harder, e.g. time.Second/10 ≈ 10 req/s
-var rateLimiter = time.Tick(time.Second / 200)
-
 // downloadedMedia keeps us from downloading the same file more than once.
 var downloadedMedia = struct {
 	mu sync.Mutex
@@ -91,7 +87,7 @@ func main() {
 	}
 	log.Printf("Discovered %d unique user IDs from vine_tweets\n", len(userIDs))
 
-	// Save profiles.json with discovered user IDs (for reuse/debug)
+	// Save discovered user IDs
 	profilesJSONPath := filepath.Join(*outDir, "profiles.json")
 	if err := writeJSONFile(profilesJSONPath, userIDs); err != nil {
 		log.Printf("Warning: failed to write %s: %v\n", profilesJSONPath, err)
@@ -99,7 +95,7 @@ func main() {
 		log.Printf("Wrote discovered user IDs to %s\n", profilesJSONPath)
 	}
 
-	// Step 3: for each user, fetch profile + all posts from profile
+	// Step 3: harvest profiles + posts for each user
 	log.Println("=== Harvesting profiles + posts per user ===")
 
 	jobs := make(chan string, *workers*2)
@@ -148,27 +144,14 @@ func collectVineSlugs(root string) ([]string, error) {
 			return nil
 		}
 
-		// You can filter by extension if you want, e.g. only .txt
-		// if !strings.HasSuffix(strings.ToLower(fi.Name()), ".txt") { return nil }
-
 		f, err := os.Open(path)
 		if err != nil {
 			return nil
 		}
 		defer f.Close()
 
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := scanner.Text()
-			matches := vineURLRe.FindAllStringSubmatch(line, -1)
-			for _, m := range matches {
-				if len(m) >= 2 {
-					slug := strings.TrimSpace(m[1])
-					if slug != "" {
-						slugSet[slug] = struct{}{}
-					}
-				}
-			}
+		if err := scanSlugsFromReader(f, slugSet); err != nil {
+			log.Printf("scanSlugsFromReader(%s): %v\n", path, err)
 		}
 		return nil
 	})
@@ -181,6 +164,24 @@ func collectVineSlugs(root string) ([]string, error) {
 		slugs = append(slugs, s)
 	}
 	return slugs, nil
+}
+
+// scanSlugsFromReader pulls vine.co/v/... slugs out of an arbitrary text stream.
+func scanSlugsFromReader(r io.Reader, slugSet map[string]struct{}) error {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		matches := vineURLRe.FindAllStringSubmatch(line, -1)
+		for _, m := range matches {
+			if len(m) >= 2 {
+				slug := strings.TrimSpace(m[1])
+				if slug != "" {
+					slugSet[slug] = struct{}{}
+				}
+			}
+		}
+	}
+	return scanner.Err()
 }
 
 // ------------------------ Step 2: from slugs → posts + user IDs ------------------------
@@ -278,7 +279,7 @@ func processUser(userID, profilesDir, postsRoot, mediaRoot string, workerID int)
 		if err != nil {
 			return fmt.Errorf("fetch profile: %w", err)
 		}
-		// rewrite if you care about media URLs in profile
+		// Rewrite URLs in profile
 		profile = rewriteURLs(profile).(map[string]interface{})
 
 		if err := writeJSONFile(profilePath, profile); err != nil {
@@ -354,15 +355,11 @@ func processUser(userID, profilesDir, postsRoot, mediaRoot string, workerID int)
 // ------------------------ HTTP + JSON helpers ------------------------
 
 func fetchJSONMap(u string) (map[string]interface{}, error) {
-	<-rateLimiter // global throttle
-
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "VineFullHarvester/1.0")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Referer", "https://archive.vine.co/")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -372,30 +369,29 @@ func fetchJSONMap(u string) (map[string]interface{}, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode == http.StatusForbidden {
-			return nil, fmt.Errorf("HTTP 403 Forbidden for %s", u)
-		}
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, u)
 	}
 
-	var m map[string]interface{}
-	dec := json.NewDecoder(resp.Body)
-	if err := dec.Decode(&m); err != nil {
+	var out map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
-	return m, nil
+	return out, nil
 }
 
-func writeJSONFile(path string, data interface{}) error {
+func writeJSONFile(path string, v interface{}) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	enc := json.NewEncoder(f)
-	// compact JSON: faster and smaller
-	if err := enc.Encode(data); err != nil {
-		_ = f.Close()
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {
@@ -425,7 +421,8 @@ func rewriteURLs(v interface{}) interface{} {
 		return t
 	case string:
 		s := t
-		if strings.Contains(s, ".cdn.vine.co") {
+		// Normalize Vine CDN URLs to vines.s3.amazonaws.com
+		if strings.Contains(s, "v.cdn.vine.co") || strings.Contains(s, "mtc.cdn.vine.co") {
 			s = strings.ReplaceAll(s, "http://v.cdn.vine.co", "https://vines.s3.amazonaws.com")
 			s = strings.ReplaceAll(s, "https://v.cdn.vine.co", "https://vines.s3.amazonaws.com")
 			s = strings.ReplaceAll(s, "http://mtc.cdn.vine.co", "https://vines.s3.amazonaws.com")
@@ -510,10 +507,11 @@ func collectPostIDsFromProfile(profile map[string]interface{}) []string {
 	return out
 }
 
-// ------------------------ media URL collection + download ------------------------
+// ------------------------ media collection + download ------------------------
 
-func collectMediaURLs(root interface{}) []string {
+func collectMediaURLs(v interface{}) []string {
 	var urls []string
+
 	var walk func(v interface{})
 	walk = func(v interface{}) {
 		switch t := v.(type) {
@@ -534,9 +532,12 @@ func collectMediaURLs(root interface{}) []string {
 					urls = append(urls, s)
 				}
 			}
+		default:
+			// ignore
 		}
 	}
-	walk(root)
+
+	walk(v)
 	return urls
 }
 
@@ -546,6 +547,7 @@ func downloadMedia(rawURL, mediaRoot string) error {
 		return err
 	}
 
+	// ensure we don't download the same file more than once
 	downloadedMedia.mu.Lock()
 	if _, ok := downloadedMedia.m[rawURL]; ok {
 		downloadedMedia.mu.Unlock()
